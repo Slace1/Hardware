@@ -6,9 +6,8 @@
 #include <cuda_runtime.h>
 #include <time.h>
 
-//#define N 10
-//#define P 10
-
+// ------------------------------- définition des fonctions ----------------------------------------------
+// Langage C pour CPU ----------------------
 //Initialisation d'une matrice 
 void MatrixInit(float *M, int n, int p) {
     for(int i=0 ; i < n*p ; i++){
@@ -27,129 +26,160 @@ void MatrixPrint(float *M, int n, int p) {
     printf("\n");
 }
 //Addition de matrices
-void MatrixAdd(float *M1, float *M2, float *Mout, int n, int p) {
+void MatrixAdd(float *M1, float *M2, float *M_sortie, int n, int p) {
     for(int i = 0; i < n*p; i++){ //Parcours toutes les valeurs de la matrice
-        Mout[i] = M1[i] + M2[i];
-    }
-}
-
-
-_global_ void cudaMatrixAdd(float *M1, float *M2, float *Mout, int n, int p) {
-    int line = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    // Handling arbitrary vector size
-    if (line<n && row<p){
-        Mout[line*n + row] = M1[line*n + row] + M2[line*n + row];
+        M_sortie[i] = M1[i] + M2[i];
     }
 }
 
 //Multiplication de matrices 
-void MatrixMult(float *M1, float *M2, float *Mout, int n) {
+void MatrixMult(float *M1, float *M2, float *M_sortie, int n) {
     for (int i=0 ; i<n ; i++){
         for (int j=0 ; j<n ; j++){
             float s = 0 ;
             for (int k=0 ; k<n ; k++){
                 s = s + M1[i*n + k]*M2[k*n + j] ;
             }
-            Mout[i*n + j] = s ;
+            M_sortie[i*n + j] = s ;
         }
     }
 }
 
-_global_ void CudaMatrixMult(float *M1, float *M2, float *Mout, int n) {
+//Langage CUDA pour GPU -------------------
+//Addition de matrices 
+__global__ void cudaMatrixAdd(float *M1, float *M2, float *M_sortie, int n, int p) { 
+    int line = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    float value = 0;
-
-    if (row < n && col < n) {
-
-        for (int i = 0; i < n; i++) {
-            value += M1[row * n + i] * M2[i * n + col];
-    }
-
-    Mout[row * n + col] = value;
-  }
-}
-__global__ void Conv2D(int M_ligne, int M_colonne, float* M, int kernel_size, int nb_kernel, float* kernel, int Mout_ligne, int Mout_colonne, float* Mout) {
     
-    //Calcul du thread
+    if (line<n && row<p){
+        M_sortie[line*n + row] = M1[line*n + row] + M2[line*n + row];
+    }
+}
+
+// Addition appelé sur le GPU et executé sur le GPU 
+__device__ float* cudaMatrixAddGB(float *M1, float *M2, float *M_sortie, int n, int p) { 
+
+    int line = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    
+
+    if (line<n && row<p){
+        M_sortie[line*n + row] = M1[line*n + row] + M2[line*n + row];
+    }
+    return M_sortie; 
+}
+
+//Multiplication de matrices sur GPU avec appel du CPU
+__global__ void CudaMatrixMult(float *M1, float *M2, float *M_sortie, int n) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int line = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row >= Mout_ligne || line>= Mout_colonne) {
-        return;
+    float s = 0;
+
+    if (row < n && line < n) {
+
+        for (int i = 0; i < n; i++) {
+            s += M1[row * n + i] * M2[i * n + line];
     }
 
-    // Initialisation
-    float value = 0;
+    M_sortie[row * n + line] = s;
+  }
+}
 
-    // Boucle sur le thread
-    for (int k = 0; k < nb_kernel; k++) {
-        for (int i = -kernel_size/2; i <= kernel_size/2; i++) {
-            for (int j = -kernel_size/2; j <= kernel_size/2; j++) {
-                // Indices de la matrice d'entrée
-                int m_row = row + i;
-                int m_line = line + j;
-                if (m_row >= 0 && m_row < M_ligne && m_line >= 0 && m_line < M_colonne) {
-                    //Convolue le kernel associé
-                    value += M[m_row * M_colonne + m_ligne] * kernel[k * kernel_size * kernel_size + (i + kernel_size/2) * kernel_size + (j + kernel_size/2)];
+//Multiplication de matrices sur GPU avec appel du GPU
+__device__ float* CudaMatrixMultNP(float *M1, float *M2, float *M_sortie, int n, int p, int m){
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int line = blockIdx.x * blockDim.x + threadIdx.x;
+    float s = 0;
+
+    if (row < n && line < n) {
+
+        for (int i = 0; i < n; i++) {
+            s += M1[row * n + i] * M2[i * n + line];
+    }
+
+    M_sortie[row * n + line] = s;
+  }
+  return M_sortie; 
+}
+
+// Définition des différentes couches ----------
+
+//Convolution2D
+__global__ void Conv2D(float* M, float* kernel, float* M_sortie, int M_ligne, int M_colonne, int kernel_size, int nb_kernel, int Msortie_ligne, int Msortie_colonne){
+    
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int line = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float s;
+
+    if (row < Msortie_ligne && line < Msortie_colonne){
+        
+        int k_k = kernel_size * kernel_size;
+        int size_M = Msortie_ligne * Msortie_colonne;
+        
+        for (int n_k = 0; n_k < nb_kernel; n_k++){
+            s = 0.0;
+            
+            for (int kernel_lig = 0; kernel_lig < kernel_size; kernel_lig++) {
+                for (int kernel_col = 0; kernel_col < kernel_size; kernel_col++) {
+                    
+                    s += M[(row + kernel_lig) * M_colonne + (line + kernel_col)] * kernel[kernel_lig * kernel_size + kernel_col + n_k * k_k];
+                    
                 }
             }
+            
+            M_sortie[row * Msortie_colonne + line + n_k * size_M] = s;
         }
     }
-
-    // Copie de la valeur de sortie
-    Mout[row * Mout_colonne + ligne] = value;
 }
 
 //Sous-echantillonnage
-__global__ void MeanPool(int M_ligne, int M_colonne, int M_prof, float* M, int meanpool_size, int Mout_ligne, int Mout_colonne, float* Mout) {
-    // Calculate the indices of the current thread
+__global__ void MeanPool(float* M, float* M_sortie, int M_ligne, int M_colonne, int M_prof, int meanpool_size, int Msortie_ligne, int Msortie_colonne){
+    
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int line = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Make sure the thread is within the bounds of the output matrix
-    if (row >= Mout_ligne || line >= Mout_colonne) {
-        return;
-    }
-
-    // Initialize the output value for the current thread
-    float value = 0;
-
-    // Perform the mean pooling for the current thread
-    for (int k = 0; k < M_prof; k++) {
-        for (int i = 0; i < meanpool_size; i++) {
-            for (int j = 0; j < meanpool_size; j++) {
-                // Calculate the indices of the input matrix
-                int m_row = row * meanpool_size + i;
-                int m_lin = line * meanpool_size + j;
-
-                // Make sure the indices are within the bounds of the input matrix
-                if (m_row >= 0 && m_row < M_ligne && m_lin >= 0 && m_lin < M_colonne) {
-                    // Add the value to the output
-                    value += M[k * M_ligne * M_colonne + m_row * M_colonne + m_lin];
+    if (row % meanpool_size == 0 && line % meanpool_size == 0){
+        
+        float s;
+        int meanpool_size_2 = meanpool_size * meanpool_size;
+        int tot_M = M_ligne * M_colonne;
+        int size_M = Msortie_ligne * Msortie_colonne;
+        
+        for (int n_profondeur = 0; n_profondeur < M_prof; n_profondeur++){
+            s = 0.0;
+            
+            for (int meanpool_lig = 0; meanpool_lig < meanpool_size; meanpool_lig++) {
+                for (int meanpool_col = 0; meanpool_col < meanpool_size; meanpool_col++) {
+                    s += M[(row + meanpool_lig) * M_colonne + line + meanpool_col + n_profondeur * tot_M] / meanpool_size_2;
+            
                 }
+            }
+            if (row == 0){
+                M_sortie[row * Msortie_colonne + (line / meanpool_size) + n_profondeur * size_M] = s;
+            }
+            else if (line == 0){
+                M_sortie[(row / meanpool_size) * Msortie_colonne + line + n_profondeur * size_M] = s;
+            }
+            else{
+                M_sortie[(row / meanpool_size) * Msortie_colonne + (line / meanpool_size) + n_profondeur * size_M] = s;
             }
         }
     }
-
-    // Calculate the mean value and store it in the output matrix
-    Mout[row * Mout_colonne + line] = value / (M_prof * meanpool_size * meanpool_size);
 }
 
 //Fonction d'activation
-__device__ float* activation_tanh(float* M, int M_ligne, int M_colonne, int M_prof){
+__device__ float* Tanh(float* M, int M_ligne, int M_colonne, int M_prof){
     
-    int lin = blockIdx.y * blockDim.y + threadIdx.y;
+    int line = blockIdx.y * blockDim.y + threadIdx.y;
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (lin < M_ligne && col < M_colonne){
+    if (line < M_ligne && row < M_colonne){
         
         int tot_M = M_ligne * M_colonne;
         
-        for (int n_prof = 0; n_prof < M_prof; n_prof++){
-            M[lin * M_colonne + row + n_prof * tot_M] = tanh(M[lin * M_colonne + row + n_prof * tot_M]);
+        for (int n_profondeur = 0; n_profondeur < M_prof; n_profondeur++){
+            M[line * M_colonne + row + n_profondeur * tot_M] = tanh(M[line * M_colonne + row + n_profondeur * tot_M]);
         }
             
     }
@@ -157,14 +187,27 @@ __device__ float* activation_tanh(float* M, int M_ligne, int M_colonne, int M_pr
     return M;
 }
 
+// Couche Linéaire M_sortie = W * M + b
+__global__ void cudaDense(float* d_M, float* d_Mout, float* d_W, float* d_b, int n, int p, int m){
+
+    d_Mout = CudaMatrixMultNP(d_M, d_W, d_Mout, n, p, m);
+    d_Mout = cudaMatrixAddGB(d_Mout, d_b, d_Mout, n, m);
+    
+}
+
+//Pour appeler la fonction device depuis le GPU 
+__global__ void kernelT(float* M, int M_ligne, int M_colonne, int M_prof){
+    Tanh(M, M_ligne, M_colonne, M_prof) ;
+}
+
 
 //Fonction principale
 int main(int argc, char* argv[]) {
     //Initialistions des paramètres
     float *M1, *M2, *M3, *M4, *M5, *M6 ;
-    float *raw_data, *C1_data, *S1_data, *C1_kernel ;
+    float *raw_data, *C1_data, *S1_data, *C1_kernel,*C2_data, *S2_data, *W_data, *B_data, *Out_data;
     float *d_M1, *d_M2, *d_M4, *d_M6 ;
-    float *d_raw_data, *d_C1_data, *d_S1_data, *d_C1_kernel ;
+    float *d_raw_data, *d_C1_data, *d_S1_data, *d_C1_kernel,*d_C2_data, *d_S2_data, *d_W_data, *d_B_data, *d_Out_data;
 
 
     if(argc!=4){
@@ -185,6 +228,11 @@ int main(int argc, char* argv[]) {
     C1_data=(float*)malloc(sizeof(float) * 28 * 28 * 6) ; 
     S1_data=(float*)malloc(sizeof(float) * 14 * 14 * 6 ) ;
     C1_kernel=(float*)malloc(sizeof(float) * 5 * 5 * 6) ;
+    C2_data=(float*)malloc(sizeof(float) * 10 * 10 * 16) ; 
+    S2_data=(float*)malloc(sizeof(float) * 5 * 5 * 16 ) ;
+    W_data=(float*)malloc(sizeof(float) * 400 * 120) ; 
+    B_data=(float*)malloc(sizeof(float) * 120  ) ;
+    Out_data=(float*)malloc(sizeof(float) * 400  ) ;
 
     //Allocution de mémoire pour une matrice sur le GPU
     cudaMalloc((void**)&d_M1, sizeof(float) * N * P);
@@ -195,6 +243,11 @@ int main(int argc, char* argv[]) {
     cudaMalloc((void**)&d_C1_data, sizeof(float) * 28 * 28 * 6);
     cudaMalloc((void**)&d_S1_data, sizeof(float) * 14 * 14 * 6 );
     cudaMalloc((void**)&d_C1_kernel, sizeof(float) * 5 * 5 * 6);
+    cudaMalloc((void**)&d_C2_data, sizeof(float) * 10 * 10 * 16);
+    cudaMalloc((void**)&d_S2_data, sizeof(float) * 5 * 5  * 16 );
+    cudaMalloc((void**)&d_W_data, sizeof(float) * 400 * 120);
+    cudaMalloc((void**)&d_B_data, sizeof(float) * 120 );
+    cudaMalloc((void**)&d_Out_data, sizeof(float) * 400 );
 //////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -205,6 +258,7 @@ int main(int argc, char* argv[]) {
     MatrixInit(raw_data, 32 , 32) ;
     MatrixInit(C1_kernel, 6 , 5*5) ;
     
+    
     for(int i = 0; i < 32*32; i++){ //Initialisation des valeurs entre 0 et 1
         raw_data[i] = abs(raw_data[i]);
     }
@@ -213,17 +267,19 @@ int main(int argc, char* argv[]) {
     }
     
     //Copie des données du CPU vers le GPU (device)
-    cudaMemcpy(d_M1, M1, sizeof(float) * N * P, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_M2, M2, sizeof(float) * N * P, cudaMemcpyHostToDevice);
     cudaMemcpy(d_raw_data, raw_data, sizeof(float) * 32 * 32 * 1, cudaMemcpyHostToDevice);
     cudaMemcpy(d_C1_kernel, C1_kernel, sizeof(float) * 5 * 5 * 6, cudaMemcpyHostToDevice);
     cudaMemcpy(d_C1_data, C1_data, sizeof(float) * 28 * 28 * 6, cudaMemcpyHostToDevice);
     cudaMemcpy(d_S1_data, S1_data, sizeof(float) * 14 * 14 * 6, cudaMemcpyHostToDevice);
-
+    cudaMemcpy(d_C2_data, C2_data, sizeof(float) * 10 * 10 * 16, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_S2_data, S2_data, sizeof(float) * 5 * 5 * 16, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_data, W_data, sizeof(float) * 400 * 120, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Out_data, Out_data, sizeof(float) * 400 , cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B_data, B_data, sizeof(float) * 120 , cudaMemcpyHostToDevice);
 
     // Configurer les paramètres de la convolution
-    dim3 dimGrid (N,P,1) ;
-    dim3 blockGrid (1,1,1) ;
+    dim3 dimGrid (32,32) ;
+    dim3 blockGrid (1,1) ;
     
 
     //--------------CPU--------------
@@ -236,35 +292,72 @@ int main(int argc, char* argv[]) {
     
     //--------------GPU--------------
     if(strcmp(argv[1],"gpu")==0){
+
+        // Partie 1------------------
+        
         printf("GPU\n");
         cudaMatrixAdd<<<dimGrid,blockGrid>>>(d_M1, d_M2, d_M4, N, P) ; //Addition de matrics sur le GPU
         CudaMatrixMult<<<dimGrid,blockGrid>>>(d_M1, d_M2, d_M6, N) ;
+        
+        //Partie 2-------------
+        
         // Exécuter la convolution sur le GPU
-        Conv2D<<<blockGrid, dimGrid>>>(32, 32, d_raw_data, 5, 6, d_C1_kernel, 28, 28, d_C1_data);
-        MeanPool<<<blockGrid, dimGrid>>>(d_C1_data, d_S1_data, 28, 28, 6, 2, 14, 14);
-        Tanh<<<blockGrid, dimGrid>>>(d_C1_data, 28, 28, 6);  
+        //Conv2D<<<blockGrid,dimGrid>>>(d_raw_data, d_C1_kernel, d_C1_data, 32, 32, 5, 6, 28, 28);
+        //kernelT<<<blockGrid,dimGrid>>>(d_C1_data, 28, 28, 6);
+        //MeanPool<<<blockGrid,dimGrid>>>(d_C1_data, d_S1_data, 28, 28, 6, 2, 14, 14);
+        //cudaDeviceSynchronize();
+
+        //Partie 3 ------------
+        //layers
+        Conv2D<<<blockGrid,dimGrid>>>(d_raw_data, d_C1_kernel, d_C1_data, 32, 32, 5, 6, 28, 28);
+        cudaDeviceSynchronize();
+
+        kernelT<<<blockGrid,dimGrid>>>(d_C1_data, 28, 28, 6);
+        cudaDeviceSynchronize();
+
+        MeanPool<<<blockGrid,dimGrid>>>(d_C1_data, d_S1_data, 28, 28, 6, 2, 14, 14);
+        cudaDeviceSynchronize();
+
+        Conv2D<<<blockGrid,dimGrid>>>(d_S1_data, d_C1_kernel, d_C2_data, 14, 14, 6, 16, 10, 10);
+        cudaDeviceSynchronize();
+
+        kernelT<<<blockGrid,dimGrid>>>(d_C2_data, 10, 10, 16);
+        cudaDeviceSynchronize();
+
+        MeanPool<<<blockGrid,dimGrid>>>(d_C2_data, d_S2_data, 10, 10, 16, 2, 5, 5);
+        cudaDeviceSynchronize();
+        
+        cudaDense<<<blockGrid,dimGrid>>>(d_C2_data, d_Out_data, d_W_data, d_B_data, 1, 400, 120);
         cudaDeviceSynchronize();
     }
 
     //Copie des données du GPU vers le CPU (local) 
     cudaMemcpy(M4, d_M4, sizeof(float) * N * P, cudaMemcpyDeviceToHost) ;
     cudaMemcpy(M6, d_M6, sizeof(float) * N * P, cudaMemcpyDeviceToHost) ;
-    // Récupérer le résultat de la convolution sur le CPU
-    cudaMemcpy(C1_data, d_C1_data, sizeof(float)*6 * 28 * 28, cudaMemcpyDeviceToHost);
 
+    // Récupérer le résultat de la convolution sur le CPU
+    cudaMemcpy(C1_data, d_C1_data, sizeof(float) * 6 * 28 * 28, cudaMemcpyDeviceToHost);
+    cudaMemcpy(S1_data, d_S1_data, sizeof(float) * 6 * 14 * 14, cudaMemcpyDeviceToHost);
+    cudaMemcpy(C2_data, d_C2_data, sizeof(float) * 16 * 10 * 10, cudaMemcpyDeviceToHost);
+    cudaMemcpy(S2_data, d_S2_data, sizeof(float) * 16 * 5 * 5, cudaMemcpyDeviceToHost);
+    cudaMemcpy(W_data, d_W_data, sizeof(float) * 400 * 120, cudaMemcpyDeviceToHost);
+    cudaMemcpy(B_data, d_B_data, sizeof(float) * 120, cudaMemcpyDeviceToHost);
+    cudaMemcpy(Out_data, d_Out_data, sizeof(float) * 400, cudaMemcpyDeviceToHost);
 //////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////
     //Affichage
-    MatrixPrint(M1, N, P) ;
-    MatrixPrint(M2, N, P) ;
-    MatrixPrint(M3, N, P) ;
-    MatrixPrint(M4, N, P) ;
-    MatrixPrint(M5, N, P) ;
-    MatrixPrint(M6, N, P) ;
+    //MatrixPrint(M1, N, P) ;
+    //MatrixPrint(M2, N, P) ;
+    //MatrixPrint(M3, N, P) ;
+    //MatrixPrint(M4, N, P) ;
+    //MatrixPrint(M5, N, P) ;
+    //MatrixPrint(M6, N, P) ;
     MatrixPrint(raw_data, 32, 32) ;
-    MatrixPrint(C1_data, 6, 28*28) ;
-    MatrixPrint(S1_data, 6, 14*14) ;
-    MatrixPrint(C1_kernel, 6, 5*5) ;
+    MatrixPrint(C1_kernel, 5, 5) ;
+    MatrixPrint(C1_data, 28, 28) ;
+    MatrixPrint(S1_data, 14, 14) ;
+    MatrixPrint(C2_data, 10, 10) ;
+    MatrixPrint(S2_data, 5, 5) ;
 
     //Libération de la mémoire du CPU
 
@@ -278,14 +371,24 @@ int main(int argc, char* argv[]) {
     free(C1_data);
     free(S1_data);
     free(C1_kernel);
+    free(C2_data);
+    free(S2_data);
+    free(W_data);
+    free(B_data);
+    free(Out_data);
 
     //Libération de la mémoire du GPU
     cudaFree(d_M1);
     cudaFree(d_M2);
     cudaFree(d_M4);
     cudaFree(d_M6);
-    cudaFree(raw_data);
-    cudaFree(C1_data);
-    cudaFree(S1_data);
-    cudaFree(C1_kernel);
+    cudaFree(d_raw_data);
+    cudaFree(d_C1_data);
+    cudaFree(d_S1_data);
+    cudaFree(d_C1_kernel);
+    cudaFree(d_C2_data);
+    cudaFree(d_S2_data);
+    cudaFree(d_W_data);
+    cudaFree(d_B_data);
+    cudaFree(d_Out_data);
 }
